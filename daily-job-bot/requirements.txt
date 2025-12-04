@@ -1,0 +1,4 @@
+requests
+openai
+numpy
+perplexityai
