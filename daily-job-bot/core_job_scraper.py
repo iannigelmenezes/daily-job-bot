@@ -3,16 +3,26 @@ import sqlite3
 import numpy as np
 from datetime import datetime
 from openai import OpenAI
-from perplexityai import Perplexity
+from perplexity import Perplexity
+import base64
+from email.mime.text import MIMEText
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # -----------------------
 # CONFIG
 # -----------------------
 OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
 PERPLEXITY_API_KEY = os.environ['PERPLEXITY_API_KEY']
-SENDGRID_API_KEY = os.environ['SENDGRID_API_KEY']
-EMAIL_TO = "you@example.com"
-EMAIL_FROM = "jobs-bot@example.com"
+EMAIL_TO = os.environ.get('EMAIL_TO', 'recipient@example.com')
+
+# Gmail API OAuth2 configuration
+SCOPES = ['https://www.googleapis.com/auth/gmail.send']
+CREDENTIALS_FILE = 'credentials.json'
+TOKEN_FILE = 'token.json'
 
 client_openai = OpenAI(api_key=OPENAI_API_KEY)
 client_perplexity = Perplexity(api_key=PERPLEXITY_API_KEY)
@@ -85,21 +95,61 @@ def summarize_jobs(candidates):
     )
     return resp.output_text
 
+def get_gmail_service():
+    """Get Gmail API service with OAuth2 authentication."""
+    creds = None
+    # Load existing token
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    
+    # If there are no (valid) credentials available, let the user log in
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(CREDENTIALS_FILE):
+                raise FileNotFoundError(f"Please download OAuth2 credentials as '{CREDENTIALS_FILE}' from Google Cloud Console")
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+        # Save the credentials for the next run
+        with open(TOKEN_FILE, 'w') as token:
+            token.write(creds.to_json())
+    
+    return build('gmail', 'v1', credentials=creds)
+
 def send_email(subject, html_body):
-    import requests
-    url = "https://api.sendgrid.com/v3/mail/send"
-    headers = {
-        "Authorization": f"Bearer {SENDGRID_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "personalizations": [{"to": [{"email": EMAIL_TO}], "subject": subject}],
-        "from": {"email": EMAIL_FROM, "name": "Jobs Bot"},
-        "content": [{"type": "text/html", "value": html_body}]
-    }
-    r = requests.post(url, headers=headers, json=payload)
-    r.raise_for_status()
-    print("Email sent successfully.")
+    """Send email using Gmail API with OAuth2."""
+    try:
+        service = get_gmail_service()
+        
+        # Create message
+        message = MIMEText(html_body, 'html')
+        message['To'] = EMAIL_TO
+        message['Subject'] = subject
+        
+        # Encode message
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
+        
+        # Send email
+        send_message = service.users().messages().send(
+            userId='me',
+            body={'raw': raw_message}
+        ).execute()
+        
+        print(f"Email sent successfully via Gmail API. Message ID: {send_message['id']}")
+        
+    except HttpError as error:
+        print(f"Gmail API error occurred: {error}")
+        raise
+    except FileNotFoundError as error:
+        print(f"OAuth2 setup error: {error}")
+        print("\nTo set up OAuth2:")
+        print("1. Go to https://console.cloud.google.com/")
+        print("2. Create a new project or select existing one")
+        print("3. Enable Gmail API")
+        print("4. Create OAuth2 credentials (Desktop application)")
+        print("5. Download credentials.json to this folder")
+        raise
 
 # -----------------------
 # MAIN LOOP
