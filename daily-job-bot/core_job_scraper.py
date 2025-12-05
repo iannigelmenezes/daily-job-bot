@@ -1,31 +1,35 @@
 import os
 import sqlite3
 import numpy as np
+import requests
+import json
 from datetime import datetime
 from openai import OpenAI
-from perplexity import Perplexity
-import base64
-from email.mime.text import MIMEText
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+from mailjet_rest import Client
 
 # -----------------------
 # CONFIG
 # -----------------------
-OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
 PERPLEXITY_API_KEY = os.environ['PERPLEXITY_API_KEY']
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')  # Keep for embeddings
 EMAIL_TO = os.environ.get('EMAIL_TO', 'recipient@example.com')
 
-# Gmail API OAuth2 configuration
-SCOPES = ['https://www.googleapis.com/auth/gmail.send']
-CREDENTIALS_FILE = 'credentials.json'
-TOKEN_FILE = 'token.json'
+# Mailjet configuration
+MAILJET_API_KEY = os.environ['MAILJET_API_KEY']
+MAILJET_API_SECRET = os.environ['MAILJET_API_SECRET']
+EMAIL_FROM = os.environ.get('EMAIL_FROM', 'noreply@yourdomain.com')
+EMAIL_FROM_NAME = os.environ.get('EMAIL_FROM_NAME', 'Job Bot')
 
-client_openai = OpenAI(api_key=OPENAI_API_KEY)
-client_perplexity = Perplexity(api_key=PERPLEXITY_API_KEY)
+# Perplexity API configuration
+PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
+perplexity_headers = {
+    "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+    "Content-Type": "application/json"
+}
+
+# Keep OpenAI client for embeddings
+client_openai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+mailjet = Client(auth=(MAILJET_API_KEY, MAILJET_API_SECRET), version='v3.1')
 
 # -----------------------
 # SQLITE DB SETUP
@@ -47,24 +51,132 @@ conn.commit()
 # -----------------------
 # HELPER FUNCTIONS
 # -----------------------
+def load_prompt_from_file(file_path="prompt.txt"):
+    """Load the job search prompt from a text file."""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            prompt = file.read().strip()
+        if not prompt:
+            raise ValueError("Prompt file is empty")
+        return prompt
+    except FileNotFoundError:
+        print(f"Warning: {file_path} not found. Using default prompt.")
+        return "Senior Treasury Manager Amsterdam remote"
+    except Exception as e:
+        print(f"Error reading prompt file: {e}. Using default prompt.")
+        return "Senior Treasury Manager Amsterdam remote"
+
 def search_jobs_perplexity(query, max_results=10):
-    resp = client_perplexity.search.create(query=query, max_results=max_results)
-    jobs = []
-    for r in resp.results:
-        jobs.append({
-            "title": r.title,
-            "url": r.url,
-            "snippet": r.snippet,
-            "company": "",  # optional, can try to parse from snippet
-        })
-    return jobs
+    """Search for actual jobs using Perplexity AI's web search capabilities."""
+    prompt = f"""
+    Search the web for current job openings for: "{query}"
+    
+    Find real job postings from job boards like Indeed, LinkedIn, Glassdoor, company websites, and other job sites.
+    Look for actual job listings that are currently posted and available.
+    
+    For each job found, extract:
+    - Job title
+    - Company name
+    - Direct URL to the job posting
+    - Brief description/snippet of requirements
+    
+    Return up to {max_results} actual job postings in this exact JSON format:
+    {{
+        "jobs": [
+            {{
+                "title": "Senior Treasury Manager",
+                "company": "Example Corp", 
+                "url": "https://www.indeed.com/viewjob?jk=abc123",
+                "snippet": "Brief description of the role and key requirements from the actual job posting"
+            }}
+        ]
+    }}
+    
+    Important: Only include real, current job postings with actual URLs. Do not generate fictional jobs.
+    Focus specifically on: {query}
+    """
+    
+    try:
+        payload = {
+            "model": "sonar",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a job search assistant with web access. Search for real, current job openings and return only actual job postings with real URLs. Always return valid JSON format."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 1500,
+            "temperature": 0.3,
+            "return_citations": True
+        }
+        
+        response = requests.post(PERPLEXITY_API_URL, json=payload, headers=perplexity_headers)
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            content = response_data['choices'][0]['message']['content']
+            
+            # Extract JSON from the response
+            try:
+                # Find JSON in the response
+                json_start = content.find('{')
+                json_end = content.rfind('}') + 1
+                if json_start != -1 and json_end > json_start:
+                    json_str = content[json_start:json_end]
+                    result = json.loads(json_str)
+                else:
+                    result = json.loads(content)
+                
+                jobs = result.get('jobs', [])
+                
+                # Ensure we return the expected format
+                formatted_jobs = []
+                for job in jobs[:max_results]:
+                    if job.get('url') and job.get('title'):  # Only include jobs with actual URLs
+                        formatted_jobs.append({
+                            "title": job.get('title', ''),
+                            "url": job.get('url', ''),
+                            "snippet": job.get('snippet', ''),
+                            "company": job.get('company', '')
+                        })
+                
+                return formatted_jobs
+                
+            except json.JSONDecodeError:
+                print("Failed to parse JSON from Perplexity response")
+                print(f"Response content: {content}")
+                return []
+        else:
+            print(f"Perplexity API error: {response.status_code}")
+            print(f"Response: {response.text}")
+            return []
+        
+    except Exception as e:
+        print(f"Error searching for jobs with Perplexity: {e}")
+        return []
 
 def embed_text(text):
-    resp = client_openai.embeddings.create(
-        input=text,
-        model="text-embedding-3-small"
-    )
-    return np.array(resp.data[0].embedding, dtype=np.float32)
+    """Create embeddings for text using OpenAI or fallback to simple hash-based similarity."""
+    if client_openai:
+        try:
+            resp = client_openai.embeddings.create(
+                input=text,
+                model="text-embedding-3-small"
+            )
+            return np.array(resp.data[0].embedding, dtype=np.float32)
+        except Exception as e:
+            print(f"Error creating embedding with OpenAI: {e}")
+            print("Falling back to simple text hash for similarity comparison")
+    
+    # Fallback: use a simple hash-based approach
+    import hashlib
+    text_hash = hashlib.md5(text.encode()).hexdigest()
+    # Convert hash to a simple numerical representation
+    return np.array([float(ord(c)) for c in text_hash[:32]], dtype=np.float32)
 
 def cosine_similarity(vec1, vec2):
     return np.dot(vec1, vec2) / (np.linalg.norm(vec1)*np.linalg.norm(vec2))
@@ -85,77 +197,122 @@ def store_job(job_id, title, company, url, embedding):
     conn.commit()
 
 def summarize_jobs(candidates):
+    """Summarize job listings using Perplexity AI, with OpenAI fallback."""
     prompt = "Write a concise daily email listing these job openings. For each, give a 2-line summary. Output as HTML list.\nJobs:\n"
     for j in candidates:
         prompt += f"- {j['title']} | {j.get('company','')} | {j['url']}\n{j['snippet']}\n\n"
-    resp = client_openai.responses.create(
-        model="gpt-4o-mini",
-        input=prompt,
-        max_output_tokens=600
-    )
-    return resp.output_text
-
-def get_gmail_service():
-    """Get Gmail API service with OAuth2 authentication."""
-    creds = None
-    # Load existing token
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     
-    # If there are no (valid) credentials available, let the user log in
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+    # Try Perplexity first
+    try:
+        payload = {
+            "model": "sonar",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that creates professional job summary emails in HTML format."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "max_tokens": 600,
+            "temperature": 0.3
+        }
+        
+        response = requests.post(PERPLEXITY_API_URL, json=payload, headers=perplexity_headers)
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            return response_data['choices'][0]['message']['content']
         else:
-            if not os.path.exists(CREDENTIALS_FILE):
-                raise FileNotFoundError(f"Please download OAuth2 credentials as '{CREDENTIALS_FILE}' from Google Cloud Console")
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open(TOKEN_FILE, 'w') as token:
-            token.write(creds.to_json())
-    
-    return build('gmail', 'v1', credentials=creds)
+            print(f"Perplexity API error for summarization: {response.status_code}")
+            raise Exception("Perplexity API failed")
+            
+    except Exception as e:
+        print(f"Error using Perplexity for summarization: {e}")
+        
+        # Fallback to OpenAI if available
+        if client_openai:
+            try:
+                print("Falling back to OpenAI for job summarization")
+                response = client_openai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a helpful assistant that creates professional job summary emails in HTML format."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    max_tokens=600
+                )
+                return response.choices[0].message.content
+            except Exception as openai_error:
+                print(f"OpenAI fallback also failed: {openai_error}")
+        
+        # Last resort: simple HTML formatting
+        html = "<ul>\n"
+        for j in candidates:
+            html += f"<li><strong>{j['title']}</strong> at {j.get('company', 'N/A')}<br>\n"
+            html += f"<a href='{j['url']}'>{j['url']}</a><br>\n"
+            html += f"{j.get('snippet', 'No description available')}</li>\n\n"
+        html += "</ul>"
+        return html
 
 def send_email(subject, html_body):
-    """Send email using Gmail API with OAuth2."""
+    """Send email using Mailjet API."""
     try:
-        service = get_gmail_service()
+        data = {
+            'Messages': [
+                {
+                    "From": {
+                        "Email": EMAIL_FROM,
+                        "Name": EMAIL_FROM_NAME
+                    },
+                    "To": [
+                        {
+                            "Email": EMAIL_TO
+                        }
+                    ],
+                    "Subject": subject,
+                    "HTMLPart": html_body
+                }
+            ]
+        }
         
-        # Create message
-        message = MIMEText(html_body, 'html')
-        message['To'] = EMAIL_TO
-        message['Subject'] = subject
+        result = mailjet.send.create(data=data)
         
-        # Encode message
-        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
-        
-        # Send email
-        send_message = service.users().messages().send(
-            userId='me',
-            body={'raw': raw_message}
-        ).execute()
-        
-        print(f"Email sent successfully via Gmail API. Message ID: {send_message['id']}")
-        
-    except HttpError as error:
-        print(f"Gmail API error occurred: {error}")
-        raise
-    except FileNotFoundError as error:
-        print(f"OAuth2 setup error: {error}")
-        print("\nTo set up OAuth2:")
-        print("1. Go to https://console.cloud.google.com/")
-        print("2. Create a new project or select existing one")
-        print("3. Enable Gmail API")
-        print("4. Create OAuth2 credentials (Desktop application)")
-        print("5. Download credentials.json to this folder")
+        if result.status_code == 200:
+            response_data = result.json()
+            message_id = response_data['Messages'][0]['To'][0]['MessageID']
+            print(f"Email sent successfully via Mailjet. Message ID: {message_id}")
+        else:
+            print(f"Failed to send email. Status code: {result.status_code}")
+            print(f"Response: {result.json()}")
+            raise Exception(f"Mailjet API error: {result.status_code}")
+            
+    except Exception as error:
+        print(f"Error sending email via Mailjet: {error}")
+        print("\nTo set up Mailjet:")
+        print("1. Sign up at https://www.mailjet.com/")
+        print("2. Go to Account Settings > API Keys")
+        print("3. Set environment variables:")
+        print("   - MAILJET_API_KEY: Your API Key")
+        print("   - MAILJET_API_SECRET: Your Secret Key")
+        print("   - EMAIL_FROM: Your verified sender email")
+        print("   - EMAIL_FROM_NAME: Your sender name (optional)")
         raise
 
 # -----------------------
 # MAIN LOOP
 # -----------------------
 def main():
-    query = "Senior Treasury Manager Amsterdam remote"
+    query = load_prompt_from_file("daily-job-bot/prompt.txt")
+    print(f"Searching for jobs with prompt: {query}")
     raw_jobs = search_jobs_perplexity(query)
     candidates = []
     for job in raw_jobs:
