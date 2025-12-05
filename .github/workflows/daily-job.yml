@@ -2,21 +2,37 @@ name: Daily Job Bot
 
 on:
   schedule:
-    - cron: "0 8 * * *"    
-  workflow_dispatch:        
+    - cron: "0 8 * * *"   # Runs daily at 08:00 UTC
+  workflow_dispatch:        # Manual trigger option
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     steps:
+      # Checkout the repo
       - uses: actions/checkout@v4
+
+      # Set up Python
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
+
+      # Upgrade pip
       - run: pip install --upgrade pip
+
+      # Install dependencies if requirements.txt exists
       - run: |
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
+
+      # Ensure the database file exists
+      - run: |
+          if [ ! -f jobs.db ]; then
+            echo "Creating empty jobs.db"
+            python -c "import sqlite3; sqlite3.connect('jobs.db').close()"
+          fi
+
+      # Run the scraper
       - run: python core_job_scraper.py
