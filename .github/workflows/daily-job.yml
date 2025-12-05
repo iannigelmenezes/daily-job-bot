@@ -3,15 +3,17 @@ name: Daily Job Bot
 on:
   schedule:
     - cron: "0 8 * * *"   # Runs daily at 08:00 UTC
-  workflow_dispatch:        # Allows manual trigger
+  workflow_dispatch:        # Manual trigger
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout the repo
+      # 1️⃣ Checkout the repo directly into the runner workspace root
       - uses: actions/checkout@v4
+        with:
+          path: .
 
       # 2️⃣ Set up Python
       - uses: actions/setup-python@v4
@@ -26,7 +28,6 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           fi
-        working-directory: ${{ github.workspace }}
 
       # 5️⃣ Ensure the database file exists
       - run: |
@@ -34,8 +35,6 @@ jobs:
             echo "Creating empty jobs.db"
             python -c "import sqlite3; sqlite3.connect('jobs.db').close()"
           fi
-        working-directory: ${{ github.workspace }}
 
       # 6️⃣ Run the scraper
       - run: python core_job_scraper.py
-        working-directory: ${{ github.workspace }}
